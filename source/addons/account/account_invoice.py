@@ -343,8 +343,8 @@ class account_invoice(models.Model):
 
         # adapt selection of field journal_id
         for field in res['fields']:
-            if field == 'journal_id' and type:
-                journal_select = self.env['account.journal']._name_search('', [('type', '=', type)], name_get_uid=1)
+            if field == 'journal_id' and context.get('journal_type'):
+                journal_select = self.env['account.journal']._name_search('', [('type', '=', context['journal_type'])], name_get_uid=1)
                 res['fields'][field]['selection'] = journal_select
 
         doc = etree.XML(res['arch'])
@@ -629,9 +629,9 @@ class account_invoice(models.Model):
         line_ids = self.move_line_id_payment_get()
         if not line_ids:
             return False
-        query = "SELECT reconcile_id FROM account_move_line WHERE id IN %s"
+        query = "SELECT count(*) FROM account_move_line WHERE reconcile_id IS NULL AND id IN %s"
         self._cr.execute(query, (tuple(line_ids),))
-        return all(row[0] for row in self._cr.fetchall())
+        return self._cr.fetchone()[0] == 0
 
     @api.multi
     def button_reset_taxes(self):
@@ -739,11 +739,12 @@ class account_invoice(models.Model):
             if self.currency_id != company_currency:
                 currency = self.currency_id.with_context(date=self.date_invoice or fields.Date.context_today(self))
                 line['currency_id'] = currency.id
-                line['amount_currency'] = line['price']
+                line['amount_currency'] = currency.round(line['price'])
                 line['price'] = currency.compute(line['price'], company_currency)
             else:
                 line['currency_id'] = False
                 line['amount_currency'] = False
+                line['price'] = self.currency_id.round(line['price'])
             line['ref'] = ref
             if self.type in ('out_invoice','in_refund'):
                 total += line['price']
@@ -778,7 +779,11 @@ class account_invoice(models.Model):
                     line2[tmp]['debit'] = (am > 0) and am or 0.0
                     line2[tmp]['credit'] = (am < 0) and -am or 0.0
                     line2[tmp]['tax_amount'] += l['tax_amount']
+                    line2[tmp]['amount_currency'] += l['amount_currency']
                     line2[tmp]['analytic_lines'] += l['analytic_lines']
+                    qty = l.get('quantity')
+                    if qty:
+                        line2[tmp]['quantity'] = line2[tmp].get('quantity', 0.0) + qty
                 else:
                     line2[tmp] = l
             line = []
@@ -802,11 +807,20 @@ class account_invoice(models.Model):
 
             ctx = dict(self._context, lang=inv.partner_id.lang)
 
+            company_currency = inv.company_id.currency_id
             if not inv.date_invoice:
+                # FORWARD-PORT UP TO SAAS-6
+                if inv.currency_id != company_currency and inv.tax_line:
+                    raise except_orm(
+                        _('Warning!'),
+                        _('No invoice date!'
+                            '\nThe invoice currency is not the same than the company currency.'
+                            ' An invoice date is required to determine the exchange rate to apply. Do not forget to update the taxes!'
+                        )
+                    )
                 inv.with_context(ctx).write({'date_invoice': fields.Date.context_today(self)})
             date_invoice = inv.date_invoice
 
-            company_currency = inv.company_id.currency_id
             # create the analytical lines, one move line per invoice line
             iml = inv._get_analytic_lines()
             # check if taxes are all computed
@@ -814,7 +828,7 @@ class account_invoice(models.Model):
             inv.check_tax_lines(compute_taxes)
 
             # I disabled the check_total feature
-            if self.env['res.users'].has_group('account.group_supplier_inv_check_total'):
+            if self.env.user.has_group('account.group_supplier_inv_check_total'):
                 if inv.type in ('in_invoice', 'in_refund') and abs(inv.check_total - inv.amount_total) >= (inv.currency_id.rounding / 2.0):
                     raise except_orm(_('Bad Total!'), _('Please verify the price of the invoice!\nThe encoded total does not match the computed total.'))
 
@@ -913,7 +927,10 @@ class account_invoice(models.Model):
                     i[2]['period_id'] = period.id
 
             ctx['invoice'] = inv
-            move = account_move.with_context(ctx).create(move_vals)
+            ctx_nolang = ctx.copy()
+            ctx_nolang.pop('lang', None)
+            move = account_move.with_context(ctx_nolang).create(move_vals)
+
             # make the invoice point to that move
             vals = {
                 'move_id': move.id,
@@ -1205,7 +1222,7 @@ class account_invoice(models.Model):
     def pay_and_reconcile(self, cr, uid, ids, pay_amount, pay_account_id, period_id, pay_journal_id,
                           writeoff_acc_id, writeoff_period_id, writeoff_journal_id, context=None, name=''):
         recs = self.browse(cr, uid, ids, context)
-        return recs.pay_and_reconcile(pay_amount, pay_account_id, period_id, pay_journal_id,
+        return account_invoice.pay_and_reconcile(recs, pay_amount, pay_account_id, period_id, pay_journal_id,
                     writeoff_acc_id, writeoff_period_id, writeoff_journal_id, name=name)
 
 class account_invoice_line(models.Model):
@@ -1278,7 +1295,7 @@ class account_invoice_line(models.Model):
         default=0.0)
     invoice_line_tax_id = fields.Many2many('account.tax',
         'account_invoice_line_tax', 'invoice_line_id', 'tax_id',
-        string='Taxes', domain=[('parent_id', '=', False)])
+        string='Taxes', domain=[('parent_id', '=', False), '|', ('active', '=', False), ('active', '=', True)])
     account_analytic_id = fields.Many2one('account.analytic.account',
         string='Analytic Account')
     company_id = fields.Many2one('res.company', string='Company',
@@ -1294,7 +1311,10 @@ class account_invoice_line(models.Model):
             doc = etree.XML(res['arch'])
             for node in doc.xpath("//field[@name='product_id']"):
                 if self._context['type'] in ('in_invoice', 'in_refund'):
-                    node.set('domain', "[('purchase_ok', '=', True)]")
+                    # Hack to fix the stable version 8.0 -> saas-12
+                    # purchase_ok will be moved from purchase to product in master #13271
+                    if 'purchase_ok' in  self.env['product.template']._fields:
+                        node.set('domain', "[('purchase_ok', '=', True)]")
                 else:
                     node.set('domain', "[('sale_ok', '=', True)]")
             res['arch'] = etree.tostring(doc)
@@ -1312,9 +1332,9 @@ class account_invoice_line(models.Model):
             raise except_orm(_('No Partner Defined!'), _("You must first select a partner!"))
         if not product:
             if type in ('in_invoice', 'in_refund'):
-                return {'value': {}, 'domain': {'product_uom': []}}
+                return {'value': {}, 'domain': {'uos_id': []}}
             else:
-                return {'value': {'price_unit': 0.0}, 'domain': {'product_uom': []}}
+                return {'value': {'price_unit': 0.0}, 'domain': {'uos_id': []}}
 
         values = {}
 
@@ -1343,13 +1363,16 @@ class account_invoice_line(models.Model):
             if product.description_purchase:
                 values['name'] += '\n' + product.description_purchase
 
-        taxes = fpos.map_tax(taxes)
-        values['invoice_line_tax_id'] = taxes.ids
+        fp_taxes = fpos.map_tax(taxes)
+        values['invoice_line_tax_id'] = fp_taxes.ids
 
         if type in ('in_invoice', 'in_refund'):
-            values['price_unit'] = price_unit or product.standard_price
+            if price_unit and price_unit != product.standard_price:
+                values['price_unit'] = price_unit
+            else:
+                values['price_unit'] = self.env['account.tax']._fix_tax_included_price(product.standard_price, taxes, fp_taxes.ids)
         else:
-            values['price_unit'] = product.lst_price
+            values['price_unit'] = self.env['account.tax']._fix_tax_included_price(product.lst_price, taxes, fp_taxes.ids)
 
         values['uos_id'] = product.uom_id.id
         if uom_id:
@@ -1364,8 +1387,6 @@ class account_invoice_line(models.Model):
 
         if company and currency:
             if company.currency_id != currency:
-                if type in ('in_invoice', 'in_refund'):
-                    values['price_unit'] = product.standard_price
                 values['price_unit'] = values['price_unit'] * currency.rate
 
             if values['uos_id'] and values['uos_id'] != product.uom_id.id:
@@ -1530,7 +1551,8 @@ class account_invoice_tax(models.Model):
             currency = self.env['res.currency'].browse(currency_id)
             currency = currency.with_context(date=date_invoice or fields.Date.context_today(self))
             amount = currency.compute(amount, company.currency_id, round=False)
-        return {'value': {'tax_amount': amount}}
+        tax_sign = (self.tax_amount / self.amount) if self.amount else 1
+        return {'value': {'tax_amount': amount * tax_sign}}
 
     @api.v8
     def compute(self, invoice):
@@ -1594,7 +1616,7 @@ class account_invoice_tax(models.Model):
     def compute(self, cr, uid, invoice_id, context=None):
         recs = self.browse(cr, uid, [], context)
         invoice = recs.env['account.invoice'].browse(invoice_id)
-        return recs.compute(invoice)
+        return account_invoice_tax.compute(recs, invoice)
 
     @api.model
     def move_line_get(self, invoice_id):
