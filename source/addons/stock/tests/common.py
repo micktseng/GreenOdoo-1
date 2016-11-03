@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-from openerp.tests import common
+from odoo.tests import common
 
 
 class TestStockCommon(common.TransactionCase):
@@ -18,6 +18,7 @@ class TestStockCommon(common.TransactionCase):
         self.MoveObj = self.env['stock.move']
         self.InvObj = self.env['stock.inventory']
         self.InvLineObj = self.env['stock.inventory.line']
+        self.LotObj = self.env['stock.production.lot']
 
         # Model Data
         self.partner_agrolite_id = self.ModelDataObj.xmlid_to_res_id('base.res_partner_2')
